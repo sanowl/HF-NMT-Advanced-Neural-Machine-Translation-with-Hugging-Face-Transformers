@@ -21,16 +21,21 @@ random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 
 # Step 1: Data Preparation
-dataset_name = "Helsinki-NLP/opus-100"
+dataset_name = "para_crawl"
 language_pairs = [("en", "fr"), ("en", "de"), ("en", "es")]  # English to French, German, and Spanish
 
-# Load and concatenate the datasets
+# Load and filter the datasets
 datasets = []
 for language_pair in language_pairs:
-    dataset = load_dataset(dataset_name, language_pair[0], language_pair[1], revision="latest")
+    src_lang, tgt_lang = language_pair
+    lang_pair_config = f"{src_lang}{tgt_lang}"
+    dataset = load_dataset(dataset_name, lang_pair_config)
     datasets.append(dataset)
-concatenated_dataset = concatenate_datasets(datasets)
 
+# Concatenate and filter the datasets for the desired language pairs
+filtered_datasets = [dataset.filter(lambda x: x["lang_pair"] == f"{src_lang}-{tgt_lang}" or x["lang_pair"] == f"{tgt_lang}-{src_lang}")
+                     for dataset, (src_lang, tgt_lang) in zip(datasets, language_pairs)]
+concatenated_dataset = concatenate_datasets(filtered_datasets)
 # Preprocess the data
 def preprocess_function(examples):
     inputs = [examples["translation"][language_pair[0]] for language_pair in language_pairs]
