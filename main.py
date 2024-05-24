@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import logging
-import random
 import numpy as np
 from transformers import (
     AutoTokenizer,
@@ -18,6 +17,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import optuna
 import os
+import secrets
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,7 +25,7 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %
 # Set random seeds for reproducibility
 RANDOM_SEED = 42
 torch.manual_seed(RANDOM_SEED)
-random.seed(RANDOM_SEED)
+secrets.SystemRandom().seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 
 # Constants
