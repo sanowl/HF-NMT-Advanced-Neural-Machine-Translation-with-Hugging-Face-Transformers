@@ -1,212 +1,208 @@
-import torch
-import torch.nn as nn
+"""
+Multilingual Translation Model Trainer
+
+This module implements a high-quality, multilingual translation model using the MT5-XL architecture.
+It handles data preparation, model training, evaluation, and inference for multiple language pairs.
+"""
+
+from __future__ import annotations
+
 import logging
-import random
-import numpy as np
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import  Tuple, Optional, Dict, Any
+
+import torch
+from datasets import concatenate_datasets, load_dataset, DatasetDict
 from transformers import (
-    AutoTokenizer,
     AutoModelForSeq2SeqLM,
+    AutoTokenizer,
     DataCollatorForSeq2Seq,
-    Seq2SeqTrainingArguments,
+    EarlyStoppingCallback,
     Seq2SeqTrainer,
-    get_scheduler,
-    EarlyStoppingCallback
-)
-from datasets import load_dataset, concatenate_datasets
-from sacrebleu import corpus_bleu
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-import optuna
-import os
-
-# Set up logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Set random seeds for reproducibility
-RANDOM_SEED = 42
-torch.manual_seed(RANDOM_SEED)
-random.seed(RANDOM_SEED)
-np.random.seed(RANDOM_SEED)
-
-# Constants
-DATASET_NAME = "para_crawl"
-LANGUAGE_PAIRS = [("en", "fr"), ("en", "de"), ("en", "es")]
-MODEL_CHECKPOINT = "google/mt5-xl"
-OUTPUT_DIR = "output"
-NUM_PROC = 4
-BATCH_SIZE = 32
-
-# Step 1: Data Preparation
-def load_and_concatenate_datasets(dataset_name, language_pairs):
-    datasets = []
-    for src_lang, tgt_lang in language_pairs:
-        dataset = load_dataset(dataset_name, f"{src_lang}{tgt_lang}")
-        filtered_dataset = dataset.filter(lambda x: x["lang_pair"] in [f"{src_lang}-{tgt_lang}", f"{tgt_lang}-{src_lang}"])
-        datasets.append(filtered_dataset)
-    return concatenate_datasets(datasets)
-
-def preprocess_function(examples, tokenizer, language_pairs):
-    inputs = [examples["translation"][src_lang] for src_lang, _ in language_pairs]
-    targets = [examples["translation"][tgt_lang] for _, tgt_lang in language_pairs]
-    model_inputs = tokenizer(inputs, truncation=True, padding=True)
-    labels = tokenizer(targets, truncation=True, padding=True)
-    model_inputs["labels"] = labels["input_ids"]
-    return model_inputs
-
-# Load and concatenate datasets
-concatenated_dataset = load_and_concatenate_datasets(DATASET_NAME, LANGUAGE_PAIRS)
-
-# Load tokenizer
-tokenizer = AutoTokenizer.from_pretrained(MODEL_CHECKPOINT)
-
-# Tokenize the dataset
-tokenized_datasets = concatenated_dataset.map(
-    lambda examples: preprocess_function(examples, tokenizer, LANGUAGE_PAIRS),
-    batched=True,
-    num_proc=NUM_PROC,
-    remove_columns=concatenated_dataset.column_names
+    Seq2SeqTrainingArguments,
 )
 
-# Step 2: Model Selection
-class CustomMT5(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.encoder = model.encoder
-        self.decoder = model.decoder
+# Configuration
+@dataclass(frozen=True)
+class TranslationConfig:
+    random_seed: int = 42
+    dataset_name: str = "para_crawl"
+    language_pairs: Tuple[Tuple[str, str], ...] = (("en", "fr"), ("en", "de"), ("en", "es"))
+    model_checkpoint: str = "google/mt5-xl"
+    output_dir: Path = field(default_factory=lambda: Path("output"))
+    num_proc: int = 4
+    batch_size: int = 32
+    learning_rate: float = 2e-5
+    num_train_epochs: int = 5
+    max_input_length: int = 512
+    max_target_length: int = 512
 
-    def forward(self, input_ids, attention_mask, labels):
-        encoder_outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        decoder_outputs = self.decoder(input_ids=labels, encoder_outputs=encoder_outputs.last_hidden_state)
-        return decoder_outputs.logits
+# Logging setup
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-def get_device():
-    if torch.cuda.is_available() and torch.backends.mps.is_available():
-        return torch.device("mps")
-    elif torch.cuda.is_available():
-        return torch.device("cuda")
-    else:
-        return torch.device("cpu")
+# Exception classes
+class TranslationError(Exception):
+    """Base exception for translation errors."""
 
-# Load model and move to device
-device = get_device()
-base_model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_CHECKPOINT)
-custom_model = CustomMT5(base_model).to(device)
+class ModelNotInitializedError(TranslationError):
+    """Raised when an operation is attempted on an uninitialized model."""
 
-# Step 3: Training Setup
-def objective(trial):
-    # Hyperparameter tuning
-    batch_size = trial.suggest_int('batch_size', 8, 64)
-    gradient_accumulation_steps = trial.suggest_int('gradient_accumulation_steps', 1, 8)
-    learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-3)
-    num_train_epochs = trial.suggest_int('num_train_epochs', 3, 10)
-    warmup_steps = trial.suggest_int('warmup_steps', 500, 2000)
+class TokenizerNotInitializedError(TranslationError):
+    """Raised when an operation is attempted with an uninitialized tokenizer."""
 
-    # Training arguments
-    training_args = Seq2SeqTrainingArguments(
-        output_dir=OUTPUT_DIR,
-        evaluation_strategy="steps",
-        learning_rate=learning_rate,
-        per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=batch_size,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        weight_decay=0.01,
-        save_total_limit=5,
-        num_train_epochs=num_train_epochs,
-        predict_with_generate=True,
-        warmup_steps=warmup_steps,
-        fp16=True,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_bleu",
-        evaluation_metrics=["bleu", "rouge"],
-        early_stopping_patience=3,
-        early_stopping_threshold=0.001,
-    )
+class DatasetLoadError(TranslationError):
+    """Raised when there's an error loading the dataset."""
 
-    # Data collator
-    data_collator = DataCollatorForSeq2Seq(tokenizer, model=custom_model)
+# Data processing
+class DataProcessor:
+    def __init__(self, config: TranslationConfig):
+        self.config = config
+        self._tokenizer: Optional[AutoTokenizer] = None
 
-    # Optimizer and scheduler
-    optimizer = torch.optim.AdamW(custom_model.parameters(), lr=learning_rate)
-    scheduler = get_scheduler("linear", optimizer, num_warmup_steps=warmup_steps, num_training_steps=training_args.max_steps)
+    def load_datasets(self) -> DatasetDict:
+        datasets = []
+        for src_lang, tgt_lang in self.config.language_pairs:
+            dataset = load_dataset(self.config.dataset_name, f"{src_lang}-{tgt_lang}")['train']
+            datasets.append(dataset)
+        return concatenate_datasets(datasets)
 
-    # Trainer
-    trainer = Seq2SeqTrainer(
-        model=custom_model,
-        args=training_args,
-        train_dataset=tokenized_datasets["train"],
-        eval_dataset=tokenized_datasets["validation"],
-        data_collator=data_collator,
-        tokenizer=tokenizer,
-        optimizers=(optimizer, scheduler),
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=training_args.early_stopping_patience, early_stopping_threshold=training_args.early_stopping_threshold)],
-    )
+    def preprocess_function(self, examples: Dict[str, Any]) -> Dict[str, Any]:
+        inputs = [examples["translation"][src_lang] for src_lang, _ in self.config.language_pairs]
+        targets = [examples["translation"][tgt_lang] for _, tgt_lang in self.config.language_pairs]
 
-    # Train model
-    trainer.train()
+        model_inputs = self._tokenizer(
+            inputs,
+            max_length=self.config.max_input_length,
+            truncation=True,
+            padding="max_length"
+        )
+        labels = self._tokenizer(
+            targets,
+            max_length=self.config.max_target_length,
+            truncation=True,
+            padding="max_length"
+        )
+        model_inputs["labels"] = labels["input_ids"]
+        return model_inputs
 
-    # Evaluate model
-    eval_results = trainer.evaluate()
-    return eval_results['eval_bleu']
+    def load_tokenizer(self) -> None:
+        self._tokenizer = AutoTokenizer.from_pretrained(self.config.model_checkpoint)
 
-# Hyperparameter tuning with Optuna
-study = optuna.create_study(direction='maximize')
-study.optimize(objective, n_trials=20)
+    def process_data(self) -> DatasetDict:
+        self.load_tokenizer()
+        dataset = self.load_datasets()
+        tokenized_datasets = dataset.map(
+            self.preprocess_function,
+            batched=True,
+            num_proc=self.config.num_proc,
+            remove_columns=dataset.column_names
+        )
+        return tokenized_datasets.train_test_split(test_size=0.1)
 
-# Print best hyperparameters
-print('Best Hyperparameters:')
-for key, value in study.best_params.items():
-    print(f'{key}: {value}')
+    @property
+    def tokenizer(self) -> AutoTokenizer:
+        if self._tokenizer is None:
+            raise TokenizerNotInitializedError("Tokenizer not initialized. Call 'load_tokenizer' first.")
+        return self._tokenizer
 
-# Step 5: Translation and Evaluation
-def translate_text(text, target_lang):
-    input_ids = tokenizer(text, return_tensors="pt", max_length=512, truncation=True)["input_ids"].to(device)
-    output = custom_model.generate(input_ids, max_length=512, num_beams=8, early_stopping=True, num_return_sequences=4, diversity_penalty=0.5)
-    translated_texts = [tokenizer.decode(ids, skip_special_tokens=True) for ids in output]
-    best_translation = max(translated_texts, key=lambda x: corpus_bleu([x], [[text]]).score)
-    return best_translation
+# Model and Trainer
+class TranslationModel:
+    def __init__(self, config: TranslationConfig, tokenized_datasets: DatasetDict, tokenizer: AutoTokenizer):
+        self.config = config
+        self.tokenized_datasets = tokenized_datasets
+        self._tokenizer = tokenizer
+        self._model: Optional[AutoModelForSeq2SeqLM] = None
+        self._trainer: Optional[Seq2SeqTrainer] = None
 
-# Example usage
-def example_translation():
-    english_text = "This is an advanced example sentence to be translated."
-    target_languages = ["fr", "de", "es"]
-    for lang in target_languages:
-        translated_text = translate_text(english_text, lang)
-        print(f"English: {english_text}")
-        print(f"{lang.upper()} Translation: {translated_text}\n")
+    def load_model(self) -> None:
+        self._model = AutoModelForSeq2SeqLM.from_pretrained(self.config.model_checkpoint)
 
-# Evaluate on test dataset
-def evaluate_model():
-    test_dataset = tokenized_datasets["test"]
-    test_dataloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, collate_fn=DataCollatorForSeq2Seq(tokenizer, model=custom_model), num_workers=NUM_PROC)
-    custom_model.eval()
-    predictions, references = [], []
-    progress_bar = tqdm(total=len(test_dataloader), desc="Evaluating", unit="batch")
+    def setup_trainer(self) -> None:
+        training_args = Seq2SeqTrainingArguments(
+            output_dir=str(self.config.output_dir),
+            evaluation_strategy="steps",
+            learning_rate=self.config.learning_rate,
+            per_device_train_batch_size=self.config.batch_size,
+            per_device_eval_batch_size=self.config.batch_size,
+            weight_decay=0.01,
+            save_total_limit=3,
+            num_train_epochs=self.config.num_train_epochs,
+            predict_with_generate=True,
+            fp16=True,
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_bleu",
+        )
 
-    for batch in test_dataloader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
-        with torch.no_grad():
-            outputs = custom_model.generate(input_ids, attention_mask=attention_mask, max_length=512, num_beams=4)
-        predicted_texts = [tokenizer.decode(ids, skip_special_tokens=True) for ids in outputs]
-        reference_texts = [tokenizer.decode(ids, skip_special_tokens=True) for ids in labels]
-        predictions.extend(predicted_texts)
-        references.extend(reference_texts)
-        progress_bar.update(1)
+        data_collator = DataCollatorForSeq2Seq(self._tokenizer, model=self._model)
 
-    progress_bar.close()
-    bleu_score = corpus_bleu(predictions, [references]).score
-    rouge_score = corpus_bleu(predictions, [references], rouge_scorer=True).score
-    print(f"Test BLEU Score: {bleu_score:.2f}")
-    print(f"Test ROUGE Score: {rouge_score:.2f}")
+        self._trainer = Seq2SeqTrainer(
+            model=self._model,
+            args=training_args,
+            train_dataset=self.tokenized_datasets["train"],
+            eval_dataset=self.tokenized_datasets["test"],
+            data_collator=data_collator,
+            tokenizer=self._tokenizer,
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+        )
 
-# Save the model checkpoint
-def save_model():
-    save_path = os.path.join(OUTPUT_DIR, "best_model")
-    custom_model.save_pretrained(save_path)
-    tokenizer.save_pretrained(save_path)
+    def train_and_evaluate(self) -> Dict[str, float]:
+        self._trainer.train()
+        return self._trainer.evaluate()
+
+    def translate(self, text: str, target_lang: str) -> str:
+        inputs = self._tokenizer([text], return_tensors="pt", max_length=self.config.max_input_length, truncation=True, padding="max_length")
+        outputs = self._model.generate(**inputs, max_length=self.config.max_target_length, num_beams=4, early_stopping=True)
+        return self._tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    def save_model(self) -> None:
+        save_path = self.config.output_dir / "best_model"
+        self._model.save_pretrained(save_path)
+        self._tokenizer.save_pretrained(save_path)
+        logger.info(f"Model saved to {save_path}")
+
+class TranslationPipeline:
+    def __init__(self, config: TranslationConfig):
+        self.config = config
+        self.data_processor: Optional[DataProcessor] = None
+        self.translation_model: Optional[TranslationModel] = None
+
+    def initialize(self) -> None:
+        self.config.output_dir.mkdir(parents=True, exist_ok=True)
+        torch.manual_seed(self.config.random_seed)
+
+        self.data_processor = DataProcessor(self.config)
+        tokenized_datasets = self.data_processor.process_data()
+
+        self.translation_model = TranslationModel(self.config, tokenized_datasets, self.data_processor.tokenizer)
+        self.translation_model.load_model()
+        self.translation_model.setup_trainer()
+
+    def run(self) -> None:
+        eval_results = self.translation_model.train_and_evaluate()
+        logger.info(f"Evaluation results: {eval_results}")
+
+        # Example translation
+        english_text = "This is an advanced example sentence to be translated."
+        for _, tgt_lang in self.config.language_pairs:
+            translated_text = self.translation_model.translate(english_text, tgt_lang)
+            logger.info(f"English: {english_text}")
+            logger.info(f"{tgt_lang.upper()} Translation: {translated_text}")
+
+        self.translation_model.save_model()
+
+def main() -> None:
+    config = TranslationConfig()
+    pipeline = TranslationPipeline(config)
+    
+    try:
+        pipeline.initialize()
+        pipeline.run()
+    except TranslationError as e:
+        logger.error(f"An error occurred during translation: {str(e)}")
+    except Exception as e:
+        logger.exception(f"An unexpected error occurred: {str(e)}")
 
 if __name__ == "__main__":
-    example_translation()
-    evaluate_model()
-    save_model()
+    main()
