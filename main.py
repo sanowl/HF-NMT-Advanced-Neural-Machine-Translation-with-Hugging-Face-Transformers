@@ -8,12 +8,15 @@ It handles data preparation, model training, evaluation, and inference for multi
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import  Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any
 
 import torch
 from datasets import concatenate_datasets, load_dataset, DatasetDict
+from dotenv import load_dotenv
+from huggingface_hub import HfApi, Repository
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
@@ -22,6 +25,9 @@ from transformers import (
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
 )
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Configuration
 @dataclass(frozen=True)
@@ -37,6 +43,8 @@ class TranslationConfig:
     num_train_epochs: int = 5
     max_input_length: int = 512
     max_target_length: int = 512
+    hf_repo_id: str = os.getenv("HF_REPO_ID")
+    hf_token: str = os.getenv("HF_TOKEN")
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -55,17 +63,17 @@ class TokenizerNotInitializedError(TranslationError):
 class DatasetLoadError(TranslationError):
     """Raised when there's an error loading the dataset."""
 
-# Data processing
+# Data processing class
 class DataProcessor:
     def __init__(self, config: TranslationConfig):
         self.config = config
         self._tokenizer: Optional[AutoTokenizer] = None
 
     def load_datasets(self) -> DatasetDict:
-        datasets = []
-        for src_lang, tgt_lang in self.config.language_pairs:
-            dataset = load_dataset(self.config.dataset_name, f"{src_lang}-{tgt_lang}")['train']
-            datasets.append(dataset)
+        datasets = [
+            load_dataset(self.config.dataset_name, f"{src_lang}{tgt_lang}")['train']
+            for src_lang, tgt_lang in self.config.language_pairs
+        ]
         return concatenate_datasets(datasets)
 
     def preprocess_function(self, examples: Dict[str, Any]) -> Dict[str, Any]:
@@ -73,16 +81,10 @@ class DataProcessor:
         targets = [examples["translation"][tgt_lang] for _, tgt_lang in self.config.language_pairs]
 
         model_inputs = self._tokenizer(
-            inputs,
-            max_length=self.config.max_input_length,
-            truncation=True,
-            padding="max_length"
+            inputs, max_length=self.config.max_input_length, truncation=True, padding="max_length"
         )
         labels = self._tokenizer(
-            targets,
-            max_length=self.config.max_target_length,
-            truncation=True,
-            padding="max_length"
+            targets, max_length=self.config.max_target_length, truncation=True, padding="max_length"
         )
         model_inputs["labels"] = labels["input_ids"]
         return model_inputs
@@ -107,7 +109,7 @@ class DataProcessor:
             raise TokenizerNotInitializedError("Tokenizer not initialized. Call 'load_tokenizer' first.")
         return self._tokenizer
 
-# Model and Trainer
+# Model and Trainer class
 class TranslationModel:
     def __init__(self, config: TranslationConfig, tokenized_datasets: DatasetDict, tokenizer: AutoTokenizer):
         self.config = config
@@ -134,9 +136,7 @@ class TranslationModel:
             load_best_model_at_end=True,
             metric_for_best_model="eval_bleu",
         )
-
         data_collator = DataCollatorForSeq2Seq(self._tokenizer, model=self._model)
-
         self._trainer = Seq2SeqTrainer(
             model=self._model,
             args=training_args,
@@ -162,6 +162,23 @@ class TranslationModel:
         self._tokenizer.save_pretrained(save_path)
         logger.info(f"Model saved to {save_path}")
 
+    def push_to_hub(self) -> None:
+        api = HfApi()
+        api.upload_folder(
+            folder_path=str(self.config.output_dir / "best_model"),
+            path_in_repo="",
+            repo_id=self.config.hf_repo_id,
+            token=self.config.hf_token
+        )
+        logger.info(f"Model pushed to Hugging Face Hub at {self.config.hf_repo_id}")
+
+        repo = Repository(local_dir=str(self.config.output_dir), clone_from=f"https://huggingface.co/{self.config.hf_repo_id}", use_auth_token=self.config.hf_token)
+        repo.git_add(auto_lfs_track=True)
+        repo.git_commit("Initial commit")
+        repo.git_push()
+        logger.info(f"Code pushed to Hugging Face Hub at {self.config.hf_repo_id}")
+
+# Translation pipeline class
 class TranslationPipeline:
     def __init__(self, config: TranslationConfig):
         self.config = config
@@ -191,11 +208,12 @@ class TranslationPipeline:
             logger.info(f"{tgt_lang.upper()} Translation: {translated_text}")
 
         self.translation_model.save_model()
+        self.translation_model.push_to_hub()
 
 def main() -> None:
     config = TranslationConfig()
     pipeline = TranslationPipeline(config)
-    
+
     try:
         pipeline.initialize()
         pipeline.run()
