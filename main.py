@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Tuple, Optional, Dict, Any
 
 import torch
-from datasets import concatenate_datasets, load_dataset, DatasetDict
+from datasets import concatenate_datasets, load_dataset, DatasetDict, Dataset
 from dotenv import load_dotenv
 from huggingface_hub import HfApi, Repository
 from transformers import (
@@ -70,11 +70,22 @@ class DataProcessor:
         self._tokenizer: Optional[AutoTokenizer] = None
 
     def load_datasets(self) -> DatasetDict:
-        datasets = [
-            load_dataset(self.config.dataset_name, f"{src_lang}{tgt_lang}")['train']
-            for src_lang, tgt_lang in self.config.language_pairs
-        ]
+        datasets = []
+        for src_lang, tgt_lang in self.config.language_pairs:
+            lang_pair = f"{src_lang}{tgt_lang}"
+            dataset = load_dataset(self.config.dataset_name, lang_pair)['train']
+            dataset = dataset.rename_column("translation", f"translation_{src_lang}_{tgt_lang}")
+            datasets.append(dataset)
+
+        for dataset in datasets:
+            dataset = dataset.map(self._align_schema)
         return concatenate_datasets(datasets)
+
+    def _align_schema(self, example: Dict[str, Any]) -> Dict[str, Any]:
+        aligned_example = {}
+        for src_lang, tgt_lang in self.config.language_pairs:
+            aligned_example["translation"] = example.get(f"translation_{src_lang}_{tgt_lang}")
+        return aligned_example
 
     def preprocess_function(self, examples: Dict[str, Any]) -> Dict[str, Any]:
         inputs = [examples["translation"][src_lang] for src_lang, _ in self.config.language_pairs]
@@ -108,6 +119,19 @@ class DataProcessor:
         if self._tokenizer is None:
             raise TokenizerNotInitializedError("Tokenizer not initialized. Call 'load_tokenizer' first.")
         return self._tokenizer
+
+    def save_tokenizer_to_repo(self) -> None:
+        logger.info(f"Saving tokenizer to repository at {self.config.hf_repo_id}...")
+        repo = Repository(
+            local_dir=str(self.config.output_dir),
+            clone_from=f"https://huggingface.co/{self.config.hf_repo_id}",
+            use_auth_token=self.config.hf_token
+        )
+        self._tokenizer.save_pretrained(repo.local_dir)
+        repo.git_add(auto_lfs_track=True)
+        repo.git_commit("Saved tokenizer")
+        repo.git_push()
+        logger.info(f"Tokenizer saved to repository at {self.config.hf_repo_id}")
 
 # Model and Trainer class
 class TranslationModel:
@@ -160,7 +184,7 @@ class TranslationModel:
         save_path = self.config.output_dir / "best_model"
         self._model.save_pretrained(save_path)
         self._tokenizer.save_pretrained(save_path)
-        logger.info(f"Model saved to {save_path}")
+        logger.info(f"Model and tokenizer saved to {save_path}")
 
     def push_to_hub(self) -> None:
         api = HfApi()
@@ -170,7 +194,7 @@ class TranslationModel:
             repo_id=self.config.hf_repo_id,
             token=self.config.hf_token
         )
-        logger.info(f"Model pushed to Hugging Face Hub at {self.config.hf_repo_id}")
+        logger.info(f"Model and tokenizer pushed to Hugging Face Hub at {self.config.hf_repo_id}")
 
         repo = Repository(local_dir=str(self.config.output_dir), clone_from=f"https://huggingface.co/{self.config.hf_repo_id}", use_auth_token=self.config.hf_token)
         repo.git_add(auto_lfs_track=True)
@@ -190,25 +214,12 @@ class TranslationPipeline:
         torch.manual_seed(self.config.random_seed)
 
         self.data_processor = DataProcessor(self.config)
-        tokenized_datasets = self.data_processor.process_data()
-
-        self.translation_model = TranslationModel(self.config, tokenized_datasets, self.data_processor.tokenizer)
-        self.translation_model.load_model()
-        self.translation_model.setup_trainer()
+        self.data_processor.load_tokenizer()
+        self.data_processor.save_tokenizer_to_repo()  # Save tokenizer to repo immediately after loading
 
     def run(self) -> None:
-        eval_results = self.translation_model.train_and_evaluate()
-        logger.info(f"Evaluation results: {eval_results}")
-
-        # Example translation
-        english_text = "This is an advanced example sentence to be translated."
-        for _, tgt_lang in self.config.language_pairs:
-            translated_text = self.translation_model.translate(english_text, tgt_lang)
-            logger.info(f"English: {english_text}")
-            logger.info(f"{tgt_lang.upper()} Translation: {translated_text}")
-
-        self.translation_model.save_model()
-        self.translation_model.push_to_hub()
+        tokenized_datasets = self.data_processor.process_data()
+        logger.info("Dataset processing completed.")
 
 def main() -> None:
     config = TranslationConfig()
