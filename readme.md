@@ -1,108 +1,79 @@
-# Multilingual Translation Model Trainer
+# Contributing to Multilingual Translation Model Trainer
 
-This repository contains a high-quality, multilingual translation model using the MT5-XL architecture. It handles data preparation, model training, evaluation, and inference for multiple language pairs.
+First off, thank you for considering contributing to the Multilingual Translation Model Trainer! It's people like you that make this project such a great tool.
 
 ## Table of Contents
-- [Features](#features)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Configuration](#configuration)
-- [Training and Evaluation](#training-and-evaluation)
-- [Inference](#inference)
-- [Logging](#logging)
-- [Contributing](#contributing)
-- [License](#license)
+1. [Code of Conduct](#code-of-conduct)
+2. [Getting Started](#getting-started)
+3. [How Can I Contribute?](#how-can-i-contribute)
+4. [Style Guidelines](#style-guidelines)
+5. [Commit Messages](#commit-messages)
+6. [Pull Requests](#pull-requests)
 
-## Features
+## Code of Conduct
 
-- **Multilingual Support:** Train and evaluate translation models for multiple language pairs.
-- **Data Processing:** Efficient data loading and preprocessing using the `datasets` library.
-- **Model Training:** Fine-tune the MT5-XL model using Hugging Face's `transformers` library.
-- **Evaluation:** Evaluate the model using BLEU scores and other relevant metrics.
-- **Inference:** Translate text from one language to another using the trained model.
-- **Logging:** Comprehensive logging for tracking progress and debugging.
+This project and everyone participating in it is governed by our [Code of Conduct](CODE_OF_CONDUCT.md). By participating, you are expected to uphold this code. Please report unacceptable behavior to [project_email@example.com].
 
-## Installation
+## Getting Started
 
-To install the necessary dependencies, run:
+- Make sure you have a [GitHub account](https://github.com/signup/free)
+- Fork the repository on GitHub
+- Clone your fork locally
+- Set up the development environment as described in the README.md
 
-```bash
-pip install -r requirements.txt
-```
+## How Can I Contribute?
 
-## Usage
+### Reporting Bugs
 
-To use the Multilingual Translation Model Trainer, follow these steps:
+- Ensure the bug was not already reported by searching on GitHub under [Issues](https://github.com/sanowl/HF-NMT-Advanced-Neural-Machine-Translation-with-Hugging-Face-Transformers/issues)
+- If you're unable to find an open issue addressing the problem, [open a new one](https://github.com/sanowl/HF-NMT-Advanced-Neural-Machine-Translation-with-Hugging-Face-Transformers/issues/new)
 
-1. **Clone the repository:**
+### Suggesting Enhancements
 
-    ```bash
-    git clone https://github.com/sanowl/HF-NMT-Advanced-Neural-Machine-Translation-with-Hugging-Face-Transformers.git
-    cd multilingual-translation-model-trainer
-    ```
+- Open a new issue with a clear title and detailed description
+- Provide specific examples to demonstrate the steps
 
-2. **Configure the settings:** Update the `TranslationConfig` in the `translation_trainer.py` file to match your requirements.
+### Your First Code Contribution
 
-3. **Run the training pipeline:**
+- Look for issues labeled "good first issue" or "help wanted"
+- If you're new to the project, these are great places to start!
 
-    ```bash
-    python translation_trainer.py
-    ```
+### Pull Requests
 
-## Configuration
+1. Fork the repo and create your branch from `main`
+2. If you've added code that should be tested, add tests
+3. Ensure the test suite passes
+4. Make sure your code lints
+5. Issue that pull request!
 
-The `TranslationConfig` class in `translation_trainer.py` allows you to configure various parameters for training:
+## Style Guidelines
 
-- `random_seed`: Seed for reproducibility.
-- `dataset_name`: The name of the dataset to be used.
-- `language_pairs`: Tuples of source and target language pairs.
-- `model_checkpoint`: Pre-trained model checkpoint from Hugging Face.
-- `output_dir`: Directory to save the trained model and outputs.
-- `num_proc`: Number of processes for data preprocessing.
-- `batch_size`: Batch size for training.
-- `learning_rate`: Learning rate for training.
-- `num_train_epochs`: Number of training epochs.
-- `max_input_length`: Maximum input sequence length.
-- `max_target_length`: Maximum target sequence length.
+### Python Style Guide
 
-## Training and Evaluation
+This project follows the [PEP 8](https://www.python.org/dev/peps/pep-0008/) style guide for Python code. Additionally:
 
-The training pipeline involves loading datasets, preprocessing, setting up the model and trainer, and running the training and evaluation:
+- Use 4 spaces for indentation
+- Use docstrings for all public classes, methods, and functions
+- Keep line length to a maximum of 120 characters
 
-```python
-pipeline.initialize()
-pipeline.run()
-```
+### Documentation Style Guide
 
-The evaluation results, including BLEU scores, will be logged.
+- Use Markdown for documentation
+- Keep language clear and concise
+- Provide examples where applicable
 
-## Inference
+## Commit Messages
 
-To translate text using the trained model:
+- Use the present tense ("Add feature" not "Added feature")
+- Use the imperative mood ("Move cursor to..." not "Moves cursor to...")
+- Limit the first line to 72 characters or less
+- Reference issues and pull requests liberally after the first line
 
-```python
-translated_text = translation_model.translate("Your text here", target_lang="fr")
-print(f"Translated Text: {translated_text}")
-```
+## Pull Requests
 
-## Logging
+1. Ensure any install or build dependencies are removed before the end of the layer when doing a build
+2. Update the README.md with details of changes to the interface, this includes new environment variables, exposed ports, useful file locations, and container parameters
+3. Increase the version numbers in any examples files and the README.md to the new version that this Pull Request would represent
+4. You may merge the Pull Request in once you have the sign-off of two other developers, or if you do not have permission to do that, you may request the second reviewer to merge it for you
 
-Logging is set up using the `logging` module to provide detailed information about the training process:
-
-```python
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-```
-
-## Contributing
-
-Contributions are welcome! Please follow these steps to contribute:
-
-1. Fork the repository.
-2. Create a new branch for your feature or bugfix.
-3. Commit your changes.
-4. Push your branch and create a pull request.
-
-## License
-
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+Thank you for your contributions!
