@@ -1,19 +1,14 @@
-"""
-Multilingual Translation Model Trainer
-
-This module implements a high-quality, multilingual translation model using the MT5-XL architecture.
-It handles data preparation, model training, evaluation, and inference for multiple language pairs.
-"""
-
 from __future__ import annotations
 
 import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, List
+import json
 
 import torch
+import numpy as np
 from datasets import concatenate_datasets, load_dataset, DatasetDict, Dataset
 from dotenv import load_dotenv
 from huggingface_hub import HfApi, Repository
@@ -24,7 +19,14 @@ from transformers import (
     EarlyStoppingCallback,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
+    get_scheduler,
 )
+from sacrebleu.metrics import BLEU
+from tqdm import tqdm
+import wandb
+from torch.optim import AdamW
+from torch.utils.data import DataLoader
+from accelerate import Accelerator
 
 # Load environment variables from .env file
 load_dotenv()
@@ -45,6 +47,22 @@ class TranslationConfig:
     max_target_length: int = 512
     hf_repo_id: str = os.getenv("HF_REPO_ID")
     hf_token: str = os.getenv("HF_TOKEN")
+    use_wandb: bool = True
+    wandb_project: str = "multilingual-translation"
+    use_fp16: bool = True
+    gradient_accumulation_steps: int = 2
+    warmup_steps: int = 500
+    eval_steps: int = 1000
+    save_steps: int = 1000
+    max_grad_norm: float = 1.0
+    use_8bit_quantization: bool = False
+    use_peft: bool = True
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    use_accelerate: bool = True
+    use_deepspeed: bool = False
+    deepspeed_config_path: Optional[str] = "ds_config.json"
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -73,9 +91,12 @@ class DataProcessor:
         datasets = []
         for src_lang, tgt_lang in self.config.language_pairs:
             lang_pair = f"{src_lang}{tgt_lang}"
-            dataset = load_dataset(self.config.dataset_name, lang_pair)['train']
-            dataset = dataset.rename_column("translation", f"translation_{src_lang}_{tgt_lang}")
-            datasets.append(dataset)
+            try:
+                dataset = load_dataset(self.config.dataset_name, lang_pair)['train']
+                dataset = dataset.rename_column("translation", f"translation_{src_lang}_{tgt_lang}")
+                datasets.append(dataset)
+            except Exception as e:
+                raise DatasetLoadError(f"Error loading dataset for {lang_pair}: {str(e)}")
 
         for dataset in datasets:
             dataset = dataset.map(self._align_schema)
@@ -141,9 +162,30 @@ class TranslationModel:
         self._tokenizer = tokenizer
         self._model: Optional[AutoModelForSeq2SeqLM] = None
         self._trainer: Optional[Seq2SeqTrainer] = None
+        self.accelerator: Optional[Accelerator] = None
 
     def load_model(self) -> None:
-        self._model = AutoModelForSeq2SeqLM.from_pretrained(self.config.model_checkpoint)
+        if self.config.use_8bit_quantization:
+            self._model = AutoModelForSeq2SeqLM.from_pretrained(
+                self.config.model_checkpoint,
+                load_in_8bit=True,
+                device_map="auto",
+            )
+        else:
+            self._model = AutoModelForSeq2SeqLM.from_pretrained(self.config.model_checkpoint)
+
+        if self.config.use_peft:
+            from peft import get_peft_model, LoraConfig, TaskType
+
+            peft_config = LoraConfig(
+                task_type=TaskType.SEQ_2_SEQ_LM,
+                inference_mode=False,
+                r=self.config.lora_r,
+                lora_alpha=self.config.lora_alpha,
+                lora_dropout=self.config.lora_dropout,
+            )
+            self._model = get_peft_model(self._model, peft_config)
+            self._model.print_trainable_parameters()
 
     def setup_trainer(self) -> None:
         training_args = Seq2SeqTrainingArguments(
@@ -156,9 +198,14 @@ class TranslationModel:
             save_total_limit=3,
             num_train_epochs=self.config.num_train_epochs,
             predict_with_generate=True,
-            fp16=True,
+            fp16=self.config.use_fp16,
             load_best_model_at_end=True,
             metric_for_best_model="eval_bleu",
+            gradient_accumulation_steps=self.config.gradient_accumulation_steps,
+            warmup_steps=self.config.warmup_steps,
+            eval_steps=self.config.eval_steps,
+            save_steps=self.config.save_steps,
+            max_grad_norm=self.config.max_grad_norm,
         )
         data_collator = DataCollatorForSeq2Seq(self._tokenizer, model=self._model)
         self._trainer = Seq2SeqTrainer(
@@ -169,14 +216,42 @@ class TranslationModel:
             data_collator=data_collator,
             tokenizer=self._tokenizer,
             callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+            compute_metrics=self.compute_metrics,
         )
 
+        if self.config.use_accelerate:
+            self.accelerator = Accelerator()
+            self._model, self._trainer.optimizer, self._trainer.lr_scheduler, self._trainer.train_dataloader = self.accelerator.prepare(
+                self._model, self._trainer.optimizer, self._trainer.lr_scheduler, self._trainer.train_dataloader
+            )
+
+        if self.config.use_deepspeed:
+            self._trainer.accelerator.state.deepspeed_plugin.deepspeed_config = json.load(open(self.config.deepspeed_config_path))
+
+    def compute_metrics(self, eval_preds):
+        preds, labels = eval_preds
+        if isinstance(preds, tuple):
+            preds = preds[0]
+        decoded_preds = self._tokenizer.batch_decode(preds, skip_special_tokens=True)
+        labels = np.where(labels != -100, labels, self._tokenizer.pad_token_id)
+        decoded_labels = self._tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+        bleu = BLEU()
+        result = bleu.corpus_score(decoded_preds, [decoded_labels])
+
+        prediction_lens = [np.count_nonzero(pred != self._tokenizer.pad_token_id) for pred in preds]
+        result = {"bleu": result.score, "length": np.mean(prediction_lens)}
+        return result
+
     def train_and_evaluate(self) -> Dict[str, float]:
+        if self.config.use_wandb:
+            wandb.init(project=self.config.wandb_project, config=self.config.__dict__)
         self._trainer.train()
         return self._trainer.evaluate()
 
-    def translate(self, text: str, target_lang: str) -> str:
-        inputs = self._tokenizer([text], return_tensors="pt", max_length=self.config.max_input_length, truncation=True, padding="max_length")
+    def translate(self, text: str, src_lang: str, tgt_lang: str) -> str:
+        inputs = self._tokenizer([f"{src_lang} to {tgt_lang}: {text}"], return_tensors="pt", max_length=self.config.max_input_length, truncation=True, padding="max_length")
+        inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
         outputs = self._model.generate(**inputs, max_length=self.config.max_target_length, num_beams=4, early_stopping=True)
         return self._tokenizer.decode(outputs[0], skip_special_tokens=True)
 
@@ -202,6 +277,11 @@ class TranslationModel:
         repo.git_push()
         logger.info(f"Code pushed to Hugging Face Hub at {self.config.hf_repo_id}")
 
+    def evaluate_on_test_set(self, test_dataset: Dataset) -> Dict[str, float]:
+        logger.info("Evaluating model on test set...")
+        predictions = self._trainer.predict(test_dataset)
+        return self.compute_metrics(predictions)
+
 # Translation pipeline class
 class TranslationPipeline:
     def __init__(self, config: TranslationConfig):
@@ -221,17 +301,14 @@ class TranslationPipeline:
         tokenized_datasets = self.data_processor.process_data()
         logger.info("Dataset processing completed.")
 
-def main() -> None:
-    config = TranslationConfig()
-    pipeline = TranslationPipeline(config)
+        self.translation_model = TranslationModel(self.config, tokenized_datasets, self.data_processor.tokenizer)
+        self.translation_model.load_model()
+        self.translation_model.setup_trainer()
 
-    try:
-        pipeline.initialize()
-        pipeline.run()
-    except TranslationError as e:
-        logger.error(f"An error occurred during translation: {str(e)}")
-    except Exception as e:
-        logger.exception(f"An unexpected error occurred: {str(e)}")
+        logger.info("Starting model training and evaluation...")
+        train_results = self.translation_model.train_and_evaluate()
+        logger.info(f"Training completed. Results: {train_results}")
 
-if __name__ == "__main__":
-    main()
+        logger.info("Evaluating model on test set...")
+        test_results = self.translation_model.evaluate_on_test_set(tokenized_datasets["test"])
+        logger.info(f"Test set evaluation results: {test_results}")
